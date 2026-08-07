@@ -37,11 +37,8 @@ from ahr999 import (
 
 
 def run_pipeline(force_refresh=False):
-    """完整数据管道：拉数据 → 计算 → 导出"""
     print(f"\n{'='*60}")
     print(f"  ₿ BTC AHR999 Pipeline  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    if force_refresh:
-        print(f"  🔄 强制刷新模式：将忽略缓存，从网络拉取最新数据")
     print(f"{'='*60}\n")
 
     # 1. 获取行情（force_refresh 透传）
@@ -271,12 +268,11 @@ def run_pages(force_refresh=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BTC AHR999 定投指标工具")
-    parser.add_argument("--web",    action="store_true", help="启动 Web 服务")
-    parser.add_argument("--cli",    action="store_true", help="命令行模式（只生成文件）")
-    parser.add_argument("--once",   action="store_true", help="跑一次后退出")
-    parser.add_argument("--pages",  action="store_true", help="生成 GitHub Pages 静态文件")
-    parser.add_argument("--force-refresh", action="store_true",
-                        help="强制从网络拉取最新数据，忽略本地缓存")
+    parser.add_argument("--web",   action="store_true")
+    parser.add_argument("--cli",   action="store_true")
+    parser.add_argument("--once",  action="store_true")
+    parser.add_argument("--pages", action="store_true")
+    parser.add_argument("--force-refresh", action="store_true")  # ✅ 新增
     args = parser.parse_args()
 
     if args.pages:
@@ -284,4 +280,4 @@ if __name__ == "__main__":
     elif args.cli or args.once:
         run_pipeline(force_refresh=args.force_refresh)
     else:
-        run_web(force_refresh=args.force_refresh)
+        run_web()
