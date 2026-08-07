@@ -4,6 +4,8 @@ import time
 import numpy as np
 import pandas as pd
 import requests
+import io
+import yfinance as yf
 from datetime import datetime
 
 CACHE_PATH = "btc_cache.csv"
@@ -26,10 +28,34 @@ def read_cache_csv_safe(path):
     raise FileNotFoundError("缓存编码损坏已删除")
 
 # ═════════════════════════════════════════════════════════
-# 2. 三级数据源（Stooq → Yahoo，Investing 需 JS）
-# ═════════════════════════════════════════════════════=
+# 2. 数据源（Yahoo 主源，Stooq 兜底）
+# ═════════════════════════════════════════════════════════
+
+def fetch_yahoo():
+    print("📡 Yahoo Finance (BTC-USD) 获取数据...")
+    df = yf.download(
+        "BTC-USD",
+        start="2013-01-01",
+        interval="1d",
+        progress=False,
+        auto_adjust=False
+    )
+    df = df.reset_index()
+    df = df.rename(columns={
+        "Date": "日期",
+        "Open": "open",
+        "High": "high",
+        "Low": "low",
+        "Close": "close",
+        "Volume": "volume"
+    })
+    df["日期"] = pd.to_datetime(df["日期"])
+    df = df.sort_values("日期").dropna(subset=["close"])
+    print(f"✅ Yahoo: {len(df)} 行")
+    return df[["日期","open","high","low","close","volume"]]
+
 def fetch_stooq():
-    print("📡 Stooq (BTCUSD) 获取数据...")
+    print("📡 Stooq (BTCUSD) 兜底中...")
     url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
     df = pd.read_csv(url)
     df.columns = df.columns.str.lower()
@@ -46,23 +72,6 @@ def fetch_stooq():
     print(f"✅ Stooq: {len(df)} 行")
     return df[["日期","open","high","low","close","volume"]]
 
-def fetch_yahoo():
-    import yfinance as yf
-    print("📡 Yahoo Finance 兜底...")
-    df = yf.download("BTC-USD", start="2013-01-01", interval="1d", progress=False)
-    df = df.reset_index()
-    df = df.rename(columns={
-        "Date": "日期",
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Volume": "volume"
-    })
-    df["日期"] = pd.to_datetime(df["日期"])
-    print(f"✅ Yahoo: {len(df)} 行")
-    return df[["日期","open","high","low","close","volume"]]
-
 def fetch_btc_data(force_refresh=False):
     if force_refresh and os.path.exists(CACHE_PATH):
         os.remove(CACHE_PATH)
@@ -71,13 +80,19 @@ def fetch_btc_data(force_refresh=False):
     if not force_refresh and os.path.exists(CACHE_PATH):
         return read_cache_csv_safe(CACHE_PATH)
 
-    for src in (fetch_stooq, fetch_yahoo):
-        try:
-            df = src()
-            save_cache_csv(df, CACHE_PATH)
-            return df
-        except Exception as e:
-            print(f"❌ {src.__name__} 失败: {e}")
+    try:
+        df = fetch_yahoo()
+        save_cache_csv(df, CACHE_PATH)
+        return df
+    except Exception as e:
+        print(f"❌ Yahoo 失败: {e}，尝试 Stooq...")
+
+    try:
+        df = fetch_stooq()
+        save_cache_csv(df, CACHE_PATH)
+        return df
+    except Exception as e:
+        print(f"❌ Stooq 也失败: {e}")
 
     raise RuntimeError("所有数据源均失败")
 
@@ -107,25 +122,22 @@ def calculate_ahr999(df):
     days = df["days_since_birth"].values
     halvings = days // 210000
     reward = 50 * (0.5 ** halvings)
-    block_per_day = 144
-    supply = days * block_per_day * reward
+    supply = days * 144 * reward
     df["supply"] = supply / 1e8  # 转为 BTC 单位
 
     # ---------- 5. ✅ 已实现市值（Realized Cap） ----------
     # TV: realized_cap = request.security("BTC_MARKETCAPREAL")
-    # 近似：SMA200 × 流通量（高保真日线近似）
+    # 用 SMA200 × 流通量作为高保真近似
     df["realized_cap"] = df["sma200"] * df["supply"]
 
     # ---------- 6. ✅ 实现价值（Realized Price） ----------
     df["realized_price"] = df["realized_cap"] / df["supply"]
 
     # ---------- 7. ✅ AHR999 ----------
-    df["ahr999"] = np.where(
-        (df["sma200"] > 0) &
-        (df["index_growth_val"] > 0),
-        (df["close"] / df["sma200"]) *
-        (df["close"] / df["index_growth_val"]),
-        np.nan
+    # TV: ahr999 = close / sma200 * (close / indexGrowthVal)
+    df["ahr999"] = (
+        df["close"] / df["sma200"] *
+        df["close"] / df["index_growth_val"]
     )
 
     # ---------- 8. 偏离幅度 ----------
@@ -161,7 +173,7 @@ def assign_zone(df):
 
 def run_pipeline(force_refresh=False):
     print(f"\n{'='*60}")
-    print(f"  ₿ BTC AHR999 Pipeline（TV 对齐版）")
+    print(f"  ₿ BTC AHR999 Pipeline（TV 对齐最终版）")
     print(f"{'='*60}\n")
 
     df = fetch_btc_data(force_refresh)
@@ -170,8 +182,7 @@ def run_pipeline(force_refresh=False):
 
     latest = df.dropna(subset=["ahr999"]).iloc[-1]
 
-    print(f"\n📡 数据源: Stooq / Yahoo")
-    print(f"📅 最新日期: {latest['日期'].strftime('%Y-%m-%d')}")
+    print(f"\n📅 最新日期: {latest['日期'].strftime('%Y-%m-%d')}")
     print(f"📈 现价: ${latest['close']:,.2f}")
     print(f"💰 实现价值 (Realized Price): ${latest['realized_price']:,.2f}")
     print(f"📊 偏离幅度: {latest['deviation_pct']:.2f}%")
