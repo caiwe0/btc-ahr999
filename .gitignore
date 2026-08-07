@@ -1,23 +1,26 @@
-# 缓存（每次运行自动生成）
+# 缓存（每次自动生成，UTF-8-sig 编码）
 btc_cache.csv
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-.venv/
-venv/
-env/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
-# OS
+# 系统文件
 Thumbs.db
-.DS_Store
+desktop.ini
 
-# 本地临时产物（Pages 产物由 Actions 生成）
-_site/
-index.html
-data.js
+# 本地配置
+config.local.py
+.env

@@ -1,109 +1,116 @@
-# ₿ BTC AHR999 指标表 + GitHub Pages 自动部署
+# ₿ BTC AHR999 定投指标站
 
-BTC AHR999 定投指标看板，自动计算 AHR999 指数、异常K线检测、买卖盈亏核算，部署到 GitHub Pages 免费托管。
+> 自动计算比特币 AHR999 囤币指标，部署到 GitHub Pages，每日自动更新。
 
 ## ✨ 功能
 
-- **AHR999 实时计算**：200日定投成本 × 幂律拟合价
-- **实价价值 + 偏离幅度**：顶部状态栏一目了然
-- **异常K线五态检测**：极端涨跌 / 横盘放量 / 量价背离
-- **FIFO 买卖盈亏**：精确核算每笔卖出利润
-- **6 区块汇总面板**：持仓 / 均价 / 浮动盈亏 / 已实现盈亏 / 总收益率 / 实价价值
-- **完全免费托管**：GitHub Pages + Actions 自动更新
+- **AHR999 指标**：`(现价/200日均价) × (现价/幂律拟合价)`
+- **区间标签**：极度低估 / 定投区 / 合理区 / 偏高 / 高估
+- **异常检测**：单日涨跌幅 >15% 或成交量异常放大
+- **买卖记账**：FIFO 计算持仓均价、浮动盈亏、已实现盈亏
+- **静态站点**：纯 HTML + JS，无需服务器，GitHub Pages 免费托管
 
-## 🚀 快速部署（Windows）
+## 📊 数据源（三级降级）
 
-### 第一步：准备环境
+| 优先级 | 数据源 | 说明 |
+|:---:|---------|------|
+| 1 | **Investing.com** | 用户指定，中文环境友好，免费无需 Key |
+| 2 | **Stooq** | `stooq.com` 免费 CSV 下载，极稳定 |
+| 3 | **Yahoo Finance** | `yfinance` 库兜底 |
 
-1. **安装 Python**（勾选 "Add to PATH"）：https://python.org/downloads/
-2. **安装 Git**（选 "Git from command line"）：https://git-scm.com/download/win
-3. **创建 GitHub Personal Access Token**：
-   - GitHub → Settings → Developer settings → Personal access tokens
-   - 勾选 `repo` + `workflow` 权限
-   - **保存好这个 Token，只显示一次！**
+缓存 6 小时，强制刷新时删除旧缓存重新拉取。
 
-### 第二步：双击部署
+## 🚀 快速开始
 
-1. 解压项目到任意目录（建议 `D:\code\btc-ahr999\`）
-2. 双击 **`deploy.bat`**
-3. 按提示输入：
-   - GitHub 用户名
-   - 仓库名（默认 `BTC-AHR999`）
-   - 密码栏填你的 **Personal Access Token**
-4. 等待推送完成
+### 本地运行
 
-### 第三步：开启 GitHub Pages
+```cmd
+cd C:\你的项目路径\btc-ahr999
 
-1. 浏览器打开 `https://github.com/你的用户名/BTC-AHR999/settings/pages`
-2. **Source** 选择 `GitHub Actions`
-3. 保存
+:: 安装依赖（首次）
+pip install -r requirements.txt
 
-### 第四步：访问网站
-
-等待 1-3 分钟，打开：
-
-```
-https://你的用户名.github.io/BTC-AHR999/
+:: 生成静态站点（强制刷新数据）
+py start.py --pages --force-refresh
 ```
 
-## 📝 修改买卖记录后更新
+成功后 `_site/` 目录包含：
+- `index.html` — 网页入口
+- `data.js` — 内嵌数据（离线可用）
+- `ahr999_data.json` — 原始 JSON
+- `BTC_AHR999.xlsx` — Excel 导出
+
+### 部署到 GitHub Pages
+
+```cmd
+git add .
+git commit -m "update: BTC AHR999 data"
+git push
+```
+
+GitHub Actions 会自动：
+1. 清理旧缓存
+2. 运行 `py start.py --pages --force-refresh`
+3. 验证产物完整性
+4. 部署到 GitHub Pages
+
+## 📁 文件结构
+
+```
+btc-ahr999/
+├── .github/workflows/deploy-pages.yml   # CI/CD 自动部署
+├── templates/index.html                  # 网页模板
+├── ahr999.py                           # 核心：数据获取 + AHR999 计算
+├── start.py                             # 入口：--pages/--web/--cli
+├── config.py                            # 配置（费率/阈值/幂律参数）
+├── requirements.txt                     # Python 依赖
+├── manual_input.csv                     # 你的买卖记录
+├── .gitignore                          # 忽略缓存/临时文件
+└── README.md
+```
+
+## 📝 记录买卖操作
 
 编辑 `manual_input.csv`：
 
 ```csv
-date,action,price,amount
-2020-03-13,buy,5000,1000
-2024-08-05,buy,52000,500
-2025-03-10,sell,95000,100000
+日期,操作,价格,数量,手续费
+2024-01-15,buy,42000,0.1,4.2
+2024-06-20,sell,65000,0.05,3.25
 ```
 
-然后 **双击 `update.bat`** → 自动重算 + 推送 → 网页自动更新。
+列说明：
+- **日期**：`YYYY-MM-DD` 格式
+- **操作**：`buy` 或 `sell`
+- **价格**：单 BTC 价格（USD）
+- **数量**：BTC 数量
+- **手续费**：本次手续费（USD）
 
-## 📊 数据来源
+改完后重新运行 `py start.py --pages --force-refresh` 并推送。
 
-自动降级策略：
-1. **Binance 公开 API**（主源，最稳定，无需 Key）
-2. **Yahoo Finance**（备用）
-3. **本地缓存**（离线可用）
-4. **合成数据**（最后兜底，保证脚本永远能跑）
+## ⚙️ 命令行参数
 
-## 📁 项目结构
+| 参数 | 说明 |
+|------|------|
+| `--pages` | 生成 `_site/` 静态站点 |
+| `--web` | 启动本地 Flask 预览（默认 `http://localhost:5000`） |
+| `--cli` | 仅控制台输出摘要 |
+| `--once` | 单次运行（默认行为） |
+| `--force-refresh` | 强制删除缓存，重新拉取数据 |
 
-```
-btc-ahr999/
-├── .github/workflows/deploy-pages.yml   # GitHub Actions 自动部署
-├── templates/index.html                   # 网页模板
-├── .gitignore
-├── README.md
-├── ahr999.py                             # 核心逻辑
-├── config.py                             # 配置（费率/阈值/颜色）
-├── start.py                              # 启动入口
-├── manual_input.csv                      # 买卖记录（编辑这个！）
-├── requirements.txt                      # Python 依赖
-├── deploy.bat                           # 首次部署（双击）
-├── update.bat                           # 更新数据（双击）
-└── run_pages.bat                        # 仅生成本地 _site/
-```
+## 🔧 常见问题
 
-## ⚙️ 配置说明
+**Q: 终端显示数据源失败怎么办？**
+A: 检查网络能否访问 `cn.investing.com`。如果在中国大陆，可能需要代理。三个数据源都失败时会抛出明确错误。
 
-编辑 `config.py`：
+**Q: AHR999 数值为 0 或 NaN？**
+A: 数据不足 200 天时会显示 NaN（正常）。如果长期为 0，检查数据是否成功拉取。
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `FEE_RATE` | 0.001 | 手续费率（0.1%） |
-| `EXTREME_LOW` | 0.45 | AHR999 极度低估阈值 |
-| `DIP_ZONE` | 1.2 | 定投区上限 |
-| `FAIR_HIGH` | 4.0 | 合理偏高上限 |
-| `POWER_LAW_A/B` | 1.51e-11 / 5.82 | 幂律拟合参数 |
+**Q: GitHub Actions 部署后 404？**
+A: 确认 Settings → Pages → Source 选的是 **GitHub Actions**。
 
-## 🔧 手动命令行
-
-```bash
-python start.py --pages   # 生成 _site/ 静态文件
-python start.py --web     # 本地 Flask 服务 (localhost:5000)
-python start.py --cli     # 只生成 Excel/JSON
-```
+**Q: 怎么修改幂律参数？**
+A: 编辑 `ahr999.py` 中的 `POWER_LAW_A` 和 `POWER_LAW_B` 常量。
 
 ## 📄 License
 
