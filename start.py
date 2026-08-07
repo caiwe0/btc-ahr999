@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """
-BTC AHR999 启动入口
+BTC AHR999 启动入口（修复版）
+================================
+修复：
+  - --force-refresh 现在真正透传给 fetch_btc_data()
+  - Pages 模式把 data_source 注入到页面顶部状态栏
+  - 所有模式统一走 run_pipeline(force_refresh=...)
+
 用法:
-  python start.py            # 默认 Web 模式
-  python start.py --web      # Web 模式 (Flask)
-  python start.py --cli      # 命令行模式 (只生成 Excel/JSON)
-  python start.py --once     # 跑一次后退出 (适合 cron)
-  python start.py --pages    # 生成 GitHub Pages 静态文件 (CI 用)
+  python start.py                # 默认 Web 模式
+  python start.py --web          # Web 模式 (Flask)
+  python start.py --cli          # 命令行模式 (只生成文件)
+  python start.py --once         # 跑一次后退出
+  python start.py --pages        # 生成 GitHub Pages 静态文件
+  python start.py --pages --force-refresh   # 强制拉最新数据
 """
 import sys
 import os
@@ -25,17 +32,20 @@ from ahr999 import (
     write_json,
     generate_html,
     print_summary,
+    LAST_DATA_SOURCE,
 )
 
 
-def run_pipeline():
+def run_pipeline(force_refresh=False):
     """完整数据管道：拉数据 → 计算 → 导出"""
     print(f"\n{'='*60}")
     print(f"  ₿ BTC AHR999 Pipeline  |  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    if force_refresh:
+        print(f"  🔄 强制刷新模式：将忽略缓存，从网络拉取最新数据")
     print(f"{'='*60}\n")
 
-    # 1. 获取行情
-    df = fetch_btc_data()
+    # 1. 获取行情（force_refresh 透传）
+    df = fetch_btc_data(force_refresh=force_refresh)
     print(f"  ✅ 行情数据: {len(df)} 行 ({df['date'].min()} → {df['date'].max()})")
 
     # 2. 计算 AHR999
@@ -68,7 +78,7 @@ def run_pipeline():
     return df, summary
 
 
-def run_web():
+def run_web(force_refresh=False):
     """启动 Flask Web 服务"""
     from flask import Flask, render_template, jsonify
     import threading
@@ -77,7 +87,7 @@ def run_web():
     app = Flask(__name__, template_folder="templates")
 
     # 启动时先跑一次
-    df, summary = run_pipeline()
+    df, summary = run_pipeline(force_refresh=force_refresh)
 
     # 定时调度
     def scheduler_loop():
@@ -86,7 +96,7 @@ def run_web():
             if (now.hour == config.SCHEDULE_HOUR and
                 now.minute == config.SCHEDULE_MINUTE):
                 try:
-                    run_pipeline()
+                    run_pipeline(force_refresh=False)
                 except Exception as e:
                     print(f"  ⚠️ 定时任务出错: {e}")
                 time.sleep(60)
@@ -107,7 +117,7 @@ def run_web():
 
     @app.route("/api/refresh", methods=["POST"])
     def api_refresh():
-        run_pipeline()
+        run_pipeline(force_refresh=True)
         return jsonify({"status": "ok", "time": datetime.now().isoformat()})
 
     print(f"\n  🌐 Web 服务启动: http://localhost:{config.PORT}")
@@ -133,9 +143,18 @@ def _generate_pages_html(summary):
     pnl_color = "#00FF7F" if summary.get("floating_pnl", 0) >= 0 else "#FF6347"
     is_profit = summary.get("floating_pnl", 0) >= 0
     profit_sign = "+" if is_profit else ""
-    unreal_pct = (summary.get("floating_pnl", 0) / summary["total_invested"] * 100) if summary.get("total_invested", 0) > 0 else 0
+    invested = summary.get("total_invested", 0) or 1
+    unreal_pct = (summary.get("floating_pnl", 0) / invested) * 100
     dev_sign = "+" if summary.get("deviation_pct", 0) >= 0 else ""
     dev_cls  = "hdr-up" if summary.get("deviation_pct", 0) >= 0 else "hdr-down"
+    data_src = summary.get("data_source", "unknown")
+    src_label = {
+        "binance": "🟢 Binance",
+        "yahoo": "🔵 Yahoo",
+        "cache": "📂 缓存",
+        "cache-stale": "⚠️ 过期缓存",
+        "synthetic": "⚠️ 合成数据",
+    }.get(data_src, data_src)
 
     replacements = {
         "__UPDATED__":   summary.get("last_date", ""),
@@ -163,16 +182,18 @@ def _generate_pages_html(summary):
         "__PRICE__":     f'{summary.get("current_price", 0):,.2f}',
         "__PNLCOLOR__":  pnl_color,
         "__ISPROFIT__":  "true" if is_profit else "false",
+        "__DATASRC__":   src_label,
         # Pages 模式：不内嵌数据
         "__DATA_PLACEHOLDER__": "null",
     }
     for k, v in replacements.items():
         tpl = tpl.replace(k, str(v))
 
+    os.makedirs("_site", exist_ok=True)
     out = "_site/index.html"
     with open(out, "w", encoding="utf-8") as f:
         f.write(tpl)
-    print(f"  ✅ 生成 {out}（引用 data.js）")
+    print(f"  ✅ 生成 {out}（引用 data.js | 数据源: {src_label}）")
 
 
 def _zone_color(zone):
@@ -182,7 +203,7 @@ def _zone_color(zone):
     }.get(zone, "#FFCCCC")
 
 
-def run_pages():
+def run_pages(force_refresh=False):
     """
     GitHub Pages 模式：
     1. 跑完整管道 → 生成 index.html + ahr999_data.json
@@ -191,9 +212,11 @@ def run_pages():
     """
     print(f"\n{'='*60}")
     print(f"  📄 GitHub Pages 静态生成模式")
+    if force_refresh:
+        print(f"  🔄 强制刷新：忽略缓存，从网络拉取")
     print(f"{'='*60}\n")
 
-    df, summary = run_pipeline()
+    df, summary = run_pipeline(force_refresh=force_refresh)
 
     # 确保 _site 目录存在
     os.makedirs("_site", exist_ok=True)
@@ -228,6 +251,7 @@ def run_pages():
 - `BTC_AHR999.xlsx` — Excel 下载
 
 最后更新: {summary.get('last_date', 'N/A')}
+数据源: {summary.get('data_source', 'unknown')}
 """
     with open("_site/README.md", "w", encoding="utf-8") as f:
         f.write(readme)
@@ -242,19 +266,22 @@ def run_pages():
     print(f"\n  🎉 _site/ 目录就绪，可发布到 GitHub Pages")
     print(f"  📊 数据: {summary.get('row_count', 0)} 行")
     print(f"  💰 最新 AHR999: {summary.get('ahr999', 0)}")
+    print(f"  📡 数据源: {summary.get('data_source', 'unknown')}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="BTC AHR999 定投指标工具")
-    parser.add_argument("--web",   action="store_true", help="启动 Web 服务")
-    parser.add_argument("--cli",   action="store_true", help="命令行模式（只生成文件）")
-    parser.add_argument("--once",  action="store_true", help="跑一次后退出")
-    parser.add_argument("--pages", action="store_true", help="生成 GitHub Pages 静态文件")
+    parser.add_argument("--web",    action="store_true", help="启动 Web 服务")
+    parser.add_argument("--cli",    action="store_true", help="命令行模式（只生成文件）")
+    parser.add_argument("--once",   action="store_true", help="跑一次后退出")
+    parser.add_argument("--pages",  action="store_true", help="生成 GitHub Pages 静态文件")
+    parser.add_argument("--force-refresh", action="store_true",
+                        help="强制从网络拉取最新数据，忽略本地缓存")
     args = parser.parse_args()
 
     if args.pages:
-        run_pages()
+        run_pages(force_refresh=args.force_refresh)
     elif args.cli or args.once:
-        run_pipeline()
+        run_pipeline(force_refresh=args.force_refresh)
     else:
-        run_web()
+        run_web(force_refresh=args.force_refresh)

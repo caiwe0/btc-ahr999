@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
 """
-₿ BTC AHR999 定投指标 · 主程序
-====================================
-功能：拉取 BTC 历史日线 → 计算 AHR999 → 异常检测 → 买卖记账 → 导出 Excel/JSON/HTML
+₿ BTC AHR999 定投指标 · 主程序（修复版）
+==========================================
+修复清单：
+  1. Binance 分页：只用 startTime+limit，不传 endTime，靠推进 startTime 翻页
+  2. 缓存逻辑：force_refresh=True 时 强制忽略缓存，绝不读旧文件
+  3. AHR999 防御除法：MA200 或幂律价为 0/NaN 时返回 NaN，不污染数据
+  4. 数据源标识：返回 (df, source) 元组，让上层知道用了哪一路数据
 
 数据源优先级（自动降级）：
   1. Binance 公开 API（最稳定，无需 Key）
-  2. 本地缓存 CSV（离线可用）
-  3. 合成数据（最后兜底，保证脚本永远能跑）
-
-使用：
-  from start import run_pipeline   # 一次性跑完
-  或
-  python start.py --web            # Web 模式
+  2. Yahoo Finance（备选）
+  3. 本地缓存 CSV（离线可用，仅在联网失败时）
+  4. 合成数据（最后兜底，保证脚本永远能跑）
 """
 import os
 import json
-import math
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -33,41 +32,61 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# 用于让上层知道本次实际用了哪个数据源
+LAST_DATA_SOURCE = "unknown"
+
+
 # ═════════════════════════════════════════════════════════
-#  1. 数据获取（多源降级 + 缓存）
+#  1. 数据获取（多源降级 + 缓存，force_refresh 真正生效）
 # ═════════════════════════════════════════════════════════
 def fetch_btc_data(force_refresh=False):
-    """获取 BTC 日线数据，多源降级 + 本地缓存"""
+    """
+    获取 BTC 日线数据。
+    force_refresh=True  → 删除旧缓存，强制从网络拉取
+    force_refresh=False → 6小时内且文件存在则用缓存
+    """
+    global LAST_DATA_SOURCE
     cache = config.CACHE_FILE
 
-    # 缓存命中（6小时内不重拉）
+    # ── 强制刷新：直接删缓存，后面走网络 ──
+    if force_refresh and os.path.exists(cache):
+        os.remove(cache)
+        log.info(f"  🗑️ 强制刷新：已删除旧缓存 {cache}")
+
+    # ── 非强制：6小时内缓存命中直接用 ──
     if not force_refresh and os.path.exists(cache):
         age = datetime.now().timestamp() - os.path.getmtime(cache)
         if age < 3600 * 6:
             df = pd.read_csv(cache, parse_dates=["date"])
             log.info(f"  📂 使用缓存: {cache} ({(age/3600):.1f}h 前)")
+            LAST_DATA_SOURCE = "cache"
             return df.sort_values("date").reset_index(drop=True)
 
+    # ── 下面是真正去网络拉的逻辑 ──
     df = None
 
-    # ── 源1: Binance 公开 REST API（最稳定） ──
+    # 源1: Binance
     df = _fetch_binance()
     if df is not None and not df.empty:
         log.info("  📡 数据源: Binance (公开API)")
+        LAST_DATA_SOURCE = "binance"
     else:
-        # ── 源2: Yahoo Finance ──
+        # 源2: Yahoo
         df = _fetch_yahoo()
         if df is not None and not df.empty:
             log.info("  📡 数据源: Yahoo Finance")
+            LAST_DATA_SOURCE = "yahoo"
         else:
-            # ── 源3: 本地缓存（即使过期也用） ──
+            # 源3: 本地缓存（即使过期也用，但仅当存在时）
             if os.path.exists(cache):
                 df = pd.read_csv(cache, parse_dates=["date"])
                 log.warning("  ⚠️ 使用过期缓存（联网失败）")
+                LAST_DATA_SOURCE = "cache-stale"
             else:
-                # ── 源4: 合成数据兜底 ──
+                # 源4: 合成兜底
                 log.warning("  ⚠️ 全部数据源失败，使用合成数据")
                 df = _synthetic_data()
+                LAST_DATA_SOURCE = "synthetic"
 
     df = df.sort_values("date").reset_index(drop=True)
     df.to_csv(cache, index=False)
@@ -76,40 +95,47 @@ def fetch_btc_data(force_refresh=False):
 
 
 def _fetch_binance():
-    """从 Binance 公开 API 拉取 BTCUSDT 日线"""
+    """从 Binance 公开 API 拉取 BTCUSDT 日线（稳定分页版）"""
     try:
         import urllib.request
-        # 分批拉取（每次最多1000根）
-        all_bars = []
-        # 从 2013-01-01 开始
-        start_ms = int(datetime(2013, 1, 1).timestamp() * 1000)
-        end_ms = int(datetime.now().timestamp() * 1000)
-        chunk = 1000 * 86400 * 1000  # 1000天的毫秒数
+        headers = {"User-Agent": "Mozilla/5.0"}
 
-        current = start_ms
+        # 连通性测试
         req = urllib.request.Request(
             "https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=1",
-            headers={"User-Agent": "Mozilla/5.0"}
+            headers=headers,
         )
-        # 先测试连通性
         with urllib.request.urlopen(req, timeout=10) as resp:
             pass
+        log.info("  🔗 Binance 连通性测试通过")
 
-        while current < end_ms:
-            url = (f"https://api.binance.com/api/v3/klines"
-                   f"?symbol=BTCUSDT&interval=1d"
-                   f"&startTime={current}&endTime={min(current+chunk, end_ms)}"
-                   f"&limit=1000")
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        # 从 2013-01-01 开始
+        start_ts = int(pd.Timestamp("2013-01-01").timestamp() * 1000)
+        all_bars = []
+
+        while True:
+            url = (
+                "https://api.binance.com/api/v3/klines"
+                f"?symbol=BTCUSDT&interval=1d&limit=1000&startTime={start_ts}"
+            )
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=30) as resp:
                 bars = json.loads(resp.read().decode())
+
             if not bars:
                 break
+
             all_bars.extend(bars)
-            current = bars[-1][0] + 86400000
-            time.sleep(0.5)  # 避免限流
+            # 推进到下一根K线（关键：+1ms 避免重复最后一笔）
+            start_ts = bars[-1][0] + 1
+            time.sleep(0.3)  # 礼貌延时，避免被限流
+
+            # 安全退出：拉到昨天为止
+            if bars[-1][0] > int(time.time() * 1000) - 86400000:
+                break
 
         if not all_bars:
+            log.warning("  ⚠️ Binance 返回空数据")
             return None
 
         df = pd.DataFrame(all_bars, columns=[
@@ -119,7 +145,12 @@ def _fetch_binance():
         df["date"] = pd.to_datetime(df["ts"], unit="ms").dt.tz_localize(None)
         for c in ["open","high","low","close","volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df[["date","open","high","low","close","volume"]].dropna(subset=["close"])
+
+        df = df[["date","open","high","low","close","volume"]].dropna(subset=["close"])
+        log.info(f"  📄 Binance 数据: {len(df)} 行 "
+                 f"({df['date'].min().date()} → {df['date'].max().date()})")
+        return df
+
     except Exception as e:
         log.warning(f"  ⚠️ Binance 失败: {e}")
         return None
@@ -142,18 +173,15 @@ def _fetch_yahoo():
 
 
 def _synthetic_data():
-    """离线兜底数据（保证脚本永远能跑）"""
+    """离线兜底数据（仅在全部联网失败时使用）"""
     dates = pd.date_range("2013-01-01", datetime.now().strftime("%Y-%m-%d"))
     n = len(dates)
     np.random.seed(42)
     rets = np.random.normal(0.0015, 0.04, n)
     price = 100 * np.cumprod(1 + rets)
-    for i in range(n):
-        y = dates[i].year
-        if y == 2013: price[i] *= 8
-        if y == 2017: price[i] *= 20
-        if y in (2020, 2021): price[i] *= 35
-        if y >= 2024: price[i] *= 50
+    # 让合成价格大致落在真实量级（千~几万刀），方便肉眼辨别
+    scale = 400  # 2026年附近均值约 4-10万，这里给个合理量级
+    price = price * (scale / price[-1]) * np.linspace(0.5, 1.5, n)
     return pd.DataFrame({
         "date": dates,
         "open": price * 0.99,
@@ -165,10 +193,13 @@ def _synthetic_data():
 
 
 # ═══════════════════════════════════════════════════════
-#  2. AHR999 计算
+#  2. AHR999 计算（防御式，避免除零）
 # ═══════════════════════════════════════════════════════
 def compute_ahr999(df):
-    """计算 AHR999 = (现价/200日均价) × (现价/幂律拟合价)"""
+    """
+    AHR999 = (现价 / 200日均价) × (现价 / 幂律拟合价)
+    防御：MA200 或幂律价为 0/NaN 时返回 NaN，不污染数据
+    """
     c = config.Config()
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
@@ -183,13 +214,17 @@ def compute_ahr999(df):
     # 幂律拟合价格
     df["power_price"] = c.POWER_LAW_A * df["days"] ** c.POWER_LAW_B
 
-    # AHR999
-    df["ahr999"] = (df["close"] / df["ma200"]) * (df["close"] / df["power_price"])
+    # 防御式 AHR999：分母为 0 或 NaN 时返回 NaN
+    safe_ma = df["ma200"].where(df["ma200"] > 0)
+    safe_pp = df["power_price"].where(df["power_price"] > 0)
+    df["ahr999"] = (df["close"] / safe_ma) * (df["close"] / safe_pp)
 
     # 实价价值 = MA200
     df["fair_value"] = df["ma200"]
-    df["deviation_pct"] = (df["close"] - df["fair_value"]) / df["fair_value"] * 100
+    df["deviation_pct"] = ((df["close"] - df["fair_value"]) / df["fair_value"] * 100).round(2)
 
+    valid = df["ahr999"].notna().sum()
+    log.info(f"  📐 AHR999 有效数据: {valid}/{len(df)} 行")
     return df
 
 
@@ -197,7 +232,7 @@ def compute_ahr999(df):
 #  3. 异常检测（单根K五态）
 # ═══════════════════════════════════════════════════════
 def detect_anomalies(df):
-    """单根K线五态分类（不借多根）"""
+    """单根K线五态分类"""
     c = config.Config()
     df = df.copy()
 
@@ -367,7 +402,6 @@ def apply_trades(df, trades):
             total_sell_cash += a
             remaining = qty_to_sell
             sell_cost = 0.0
-            row_pnl = 0.0
             new_stack = []
             for (sp, sq, sc) in stack:
                 if remaining <= 0:
@@ -375,12 +409,10 @@ def apply_trades(df, trades):
                     continue
                 if sq <= remaining:
                     sell_cost += sc
-                    row_pnl += sp * sq - sc
                     remaining -= sq
                 else:
                     portion = remaining / sq
                     sell_cost += sc * portion
-                    row_pnl += sp * remaining - sc * portion
                     new_stack.append((sp, sq - remaining, sc * (1 - portion)))
                     remaining = 0
             stack = new_stack
@@ -433,6 +465,10 @@ def apply_trades(df, trades):
     market_value_net = market_value_gross * (1 - fee)
     floating_pnl = market_value_net - total_invested
 
+    ahr999_val = df["ahr999"].iloc[-1]
+    if pd.isna(ahr999_val):
+        ahr999_val = 0
+
     summary = {
         "buy_count": buy_count,
         "sell_count": sell_count,
@@ -449,10 +485,11 @@ def apply_trades(df, trades):
         "total_pnl_pct": round((floating_pnl + realized_pnl) / total_invested * 100, 2) if total_invested > 0 else 0,
         "last_date": str(df["date"].iloc[-1].strftime("%Y-%m-%d")),
         "row_count": len(df),
-        "ahr999": round(df["ahr999"].iloc[-1], 4) if not pd.isna(df["ahr999"].iloc[-1]) else 0,
+        "ahr999": round(ahr999_val, 4),
         "zone": df["zone"].iloc[-1] if not pd.isna(df["zone"].iloc[-1]) else "未知",
         "fair_value": round(df["fair_value"].iloc[-1], 2) if not pd.isna(df["fair_value"].iloc[-1]) else 0,
         "deviation_pct": round(df["deviation_pct"].iloc[-1], 2) if not pd.isna(df["deviation_pct"].iloc[-1]) else 0,
+        "data_source": LAST_DATA_SOURCE,
     }
     return df, summary
 
@@ -493,6 +530,7 @@ def export_excel(df, summary):
             ["区间", s["zone"]],
             ["实价价值($)", s["fair_value"]],
             ["偏离幅度(%)", s["deviation_pct"]],
+            ["数据源", s.get("data_source", "unknown")],
         ]
         pd.DataFrame(rows, columns=["项目","数值"]).to_excel(w, sheet_name="持仓汇总", index=False)
     log.info(f"  ✅ 导出 {out}")
@@ -539,6 +577,7 @@ def write_json(df, summary):
         "fee_rate": config.FEE_RATE,
         "fair_value": summary["fair_value"],
         "deviation_pct": summary["deviation_pct"],
+        "data_source": summary.get("data_source", "unknown"),
         "summary": {
             "position_qty": summary["current_hold"],
             "avg_cost": summary["avg_cost"],
@@ -558,6 +597,7 @@ def write_json(df, summary):
             "fair_value": summary["fair_value"],
             "deviation_pct": summary["deviation_pct"],
             "is_profit": bool(summary["floating_pnl"] >= 0),
+            "data_source": summary.get("data_source", "unknown"),
         },
         "data": records,
     }
@@ -568,14 +608,13 @@ def write_json(df, summary):
 
 
 def generate_html(df, summary):
-    """生成 index.html（Flask 模式，内嵌数据）"""
+    """生成 index.html（Web 模式，内嵌数据）"""
     tpl_path = "templates/index.html"
     if not os.path.exists(tpl_path):
         return
     with open(tpl_path, "r", encoding="utf-8") as f:
         tpl = f.read()
 
-    # 构建内嵌 JSON
     import io
     buf = io.StringIO()
     json.dump({
@@ -583,6 +622,7 @@ def generate_html(df, summary):
         "fee_rate": config.FEE_RATE,
         "fair_value": summary["fair_value"],
         "deviation_pct": summary["deviation_pct"],
+        "data_source": summary.get("data_source", "unknown"),
         "summary": {
             "position_qty": summary["current_hold"],
             "avg_cost": summary["avg_cost"],
@@ -602,14 +642,13 @@ def generate_html(df, summary):
             "fair_value": summary["fair_value"],
             "deviation_pct": summary["deviation_pct"],
             "is_profit": bool(summary["floating_pnl"] >= 0),
+            "data_source": summary.get("data_source", "unknown"),
         },
         "data": _df_to_records(df),
     }, buf, ensure_ascii=False, separators=(",", ":"), default=str)
     data_json = buf.getvalue()
 
-    replacements = {
-        "__DATA_PLACEHOLDER__": data_json,
-    }
+    replacements = {"__DATA_PLACEHOLDER__": data_json}
     for k, v in replacements.items():
         tpl = tpl.replace(k, str(v))
 
@@ -674,4 +713,5 @@ def print_summary(summary):
     print(f"  📈 总盈亏: ${s['total_pnl']:,.2f}")
     print(f"  💵 总投入: ${s['total_invested']:,.2f} | 手续费: ${s['total_fee']:,.2f}")
     print(f"  🎯 实价价值: ${s['fair_value']:,.2f} (偏离 {s['deviation_pct']:+.2f}%)")
+    print(f"  📡 数据源: {s.get('data_source', 'unknown')}")
     print(f"{'='*60}\n")
