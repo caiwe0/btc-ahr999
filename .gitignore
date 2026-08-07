@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Project cache (will be regenerated)
+btc_cache.csv
+
+# Local HTML (generated, not source)
+index.html
+
+# ZIP files
+*.zip
+
+# Bat files (Windows only, optional - remove if you want them tracked)
+# *.bat
