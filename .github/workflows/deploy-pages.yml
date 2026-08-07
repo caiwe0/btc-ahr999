@@ -2,8 +2,7 @@ name: Deploy GitHub Pages
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -19,33 +18,26 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: 清理旧缓存
+        run: rm -f btc_cache.csv
+
+      - name: 设置 Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: 安装依赖
+        run: pip install -r requirements.txt
 
-      - name: Generate static site
-        run: |
-          python start.py --pages
+      - name: 生成静态站点
+        run: python start.py --pages --force-refresh
 
-      - name: Check _site output
-        run: |
-          ls -la
-          ls -la _site || true
-          test -f _site/index.html || { echo "ERROR: _site/index.html not found"; exit 1; }
-
-      - name: Upload Pages artifact
+      - name: 上传 Pages 产物
         uses: actions/upload-pages-artifact@v3
         with:
-          path: ./_site
+          path: _site
 
   deploy:
     needs: build
