@@ -4,7 +4,7 @@ import numpy as np
 from btc_data import load_and_clean_btc_data
 
 # ═════════════════════════════════════════════════════════
-# AHR999 计算（✅ 修复 Power Law + 数值稳定性）
+# AHR999 计算（✅ 修复 Index.clip 错误 + 幂律数值稳定）
 # ═════════════════════════════════════════════════════════
 
 def calculate_sma200(df: pd.DataFrame) -> pd.DataFrame:
@@ -17,17 +17,21 @@ def calculate_sma200(df: pd.DataFrame) -> pd.DataFrame:
 
 def calculate_power_law(df: pd.DataFrame) -> pd.DataFrame:
     """
-    幂律估值（TV 对齐）
+    幂律估值（AHR999 专用）
     y = 10^(a * log10(x) + b)
-    x = 天数（从 2009-01-03 起算）
+    x = 距比特币创世块的天数
+
+    系数来源：ahr999 社区常用拟合
     """
     genesis = pd.Timestamp("2009-01-03")
 
-    # ✅ 正确方式：逐行计算天数
-    days = (df.index - genesis).days + 1
-    days = days.clip(lower=1)
+    # ✅ 转为 numpy array，避免 Index 没有 clip()
+    days = np.asarray((df.index - genesis).days, dtype=float) + 1.0
+    days = np.where(days < 1, 1.0, days)
 
-    a, b = 5.84, -17.01  # ✅ 九神官方系数
+    # ✅ 九神 AHR999 标准系数
+    a = 2.48
+    b = -17.02
 
     df["index_growth_val"] = 10 ** (a * np.log10(days) + b)
     return df
@@ -37,13 +41,15 @@ def calculate_ahr999(df: pd.DataFrame) -> pd.DataFrame:
     df = calculate_sma200(df)
     df = calculate_power_law(df)
 
-    # ✅ 只在有效数据上计算 AHR999
+    # ✅ 安全掩码，防止除 0 或 NaN
     mask = (
         df["sma200"].notna() &
         df["index_growth_val"].notna() &
+        (df["sma200"] > 0) &
         (df["index_growth_val"] > 0)
     )
 
+    # AHR999 = (Price / 200DMA) × (Price / PowerLaw)
     df["ahr999"] = np.where(
         mask,
         (df["close"] / df["sma200"]) *
@@ -52,8 +58,10 @@ def calculate_ahr999(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # 偏离幅度（相对 SMA200）
-    df["deviation_pct"] = (
-        (df["close"] - df["sma200"]) / df["sma200"] * 100
+    df["deviation_pct"] = np.where(
+        df["sma200"] > 0,
+        (df["close"] - df["sma200"]) / df["sma200"] * 100,
+        np.nan
     )
 
     # 日涨跌幅
@@ -63,6 +71,9 @@ def calculate_ahr999(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def assign_zone(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    AHR999 区间划分（九神标准）
+    """
     conditions = [
         df["ahr999"] < 0.45,
         df["ahr999"] < 1.0,
@@ -80,13 +91,14 @@ def assign_zone(df: pd.DataFrame) -> pd.DataFrame:
 
 def run_pipeline(src_path: str = "btc_cache.csv") -> pd.DataFrame:
     print("\n" + "=" * 60)
-    print("  ₿ BTC AHR999 Pipeline（✅ 修复版）")
+    print("  ₿ BTC AHR999 Pipeline（✅ 最终稳定版）")
     print("=" * 60 + "\n")
 
     df = load_and_clean_btc_data(src_path)
     df = calculate_ahr999(df)
     df = assign_zone(df)
 
+    # 取最新有效数据
     latest = df.dropna(subset=["ahr999"]).iloc[-1]
 
     print(f"\n📅 最新日期: {latest.name.strftime('%Y-%m-%d')}")
