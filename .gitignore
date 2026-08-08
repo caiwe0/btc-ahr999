@@ -1,26 +1,7 @@
-# 缓存（每次自动生成，UTF-8-sig 编码）
-btc_cache.csv
-
-# Python
 __pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-dist/
-*.egg-info/
-
-# IDE
+*.pyc
+_site/
+*.csv
+!btc_cache.csv
 .vscode/
 .idea/
-*.swp
-*.swo
-
-# 系统文件
-Thumbs.db
-desktop.ini
-
-# 本地配置
-config.local.py
-.env

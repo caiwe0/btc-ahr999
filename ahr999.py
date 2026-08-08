@@ -1,197 +1,125 @@
-import os
+"""
+₿ BTC AHR999 指标计算（对齐 TradingView 九神公式）
+
+公式：
+  sma200        = ta.sma(close, 200)
+  daysSinceBirth = max((time - 2009-01-03) / 86400, 1)
+  logCoinAge    = log10(daysSinceBirth)
+  indexGrowthVal= 10^(5.84 * logCoinAge - 17.01)
+  ahr999        = close / sma200 * (close / indexGrowthVal)
+
+网页展示字段：现价 / AHR999 / 偏离幅度(SMA200) / SMA200 / 幂律估值 / 区间
+（不展示"实现价值"）
+"""
 import math
-import time
 import numpy as np
 import pandas as pd
-import requests
-import io
-import yfinance as yf
-from datetime import datetime
 
-CACHE_PATH = "btc_cache.csv"
+from btc_data import load_btc_data
 
-# ═════════════════════════════════════════════════════════
-# 1. 缓存读写（UTF‑8‑SIG，解决 CI 编码问题）
-# ═════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+# 1. 核心计算
+# ════════════════════════════════════════════════════════
 
-def save_cache_csv(df, path):
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+def calculate_ahr999(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy().sort_values("date").reset_index(drop=True)
 
-def read_cache_csv_safe(path):
-    for enc in ("utf-8-sig", "utf-8", "gbk", "cp936"):
-        try:
-            return pd.read_csv(path, parse_dates=["日期"])
-        except UnicodeDecodeError:
-            continue
-    if os.path.exists(path):
-        os.remove(path)
-    raise FileNotFoundError("缓存编码损坏已删除")
+    # ---------- SMA200 ----------
+    df["sma200"] = df["close"].rolling(window=200).mean()
 
-# ═════════════════════════════════════════════════════════
-# 2. 数据源（Yahoo 主源，Stooq 兜底）
-# ═════════════════════════════════════════════════════════
-
-def fetch_yahoo():
-    print("📡 Yahoo Finance (BTC-USD) 获取数据...")
-    df = yf.download(
-        "BTC-USD",
-        start="2013-01-01",
-        interval="1d",
-        progress=False,
-        auto_adjust=False
-    )
-    df = df.reset_index()
-    df = df.rename(columns={
-        "Date": "日期",
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Volume": "volume"
-    })
-    df["日期"] = pd.to_datetime(df["日期"])
-    df = df.sort_values("日期").dropna(subset=["close"])
-    print(f"✅ Yahoo: {len(df)} 行")
-    return df[["日期","open","high","low","close","volume"]]
-
-def fetch_stooq():
-    print("📡 Stooq (BTCUSD) 兜底中...")
-    url = "https://stooq.com/q/d/l/?s=btcusd&i=d"
-    df = pd.read_csv(url)
-    df.columns = df.columns.str.lower()
-    df = df.rename(columns={
-        "date": "日期",
-        "open": "open",
-        "high": "high",
-        "low": "low",
-        "close": "close",
-        "volume": "volume"
-    })
-    df["日期"] = pd.to_datetime(df["日期"])
-    df = df.sort_values("日期").dropna(subset=["close"])
-    print(f"✅ Stooq: {len(df)} 行")
-    return df[["日期","open","high","low","close","volume"]]
-
-def fetch_btc_data(force_refresh=False):
-    if force_refresh and os.path.exists(CACHE_PATH):
-        os.remove(CACHE_PATH)
-        print("🗑️ 强制刷新缓存")
-
-    if not force_refresh and os.path.exists(CACHE_PATH):
-        return read_cache_csv_safe(CACHE_PATH)
-
-    try:
-        df = fetch_yahoo()
-        save_cache_csv(df, CACHE_PATH)
-        return df
-    except Exception as e:
-        print(f"❌ Yahoo 失败: {e}，尝试 Stooq...")
-
-    try:
-        df = fetch_stooq()
-        save_cache_csv(df, CACHE_PATH)
-        return df
-    except Exception as e:
-        print(f"❌ Stooq 也失败: {e}")
-
-    raise RuntimeError("所有数据源均失败")
-
-# ═════════════════════════════════════════════════════════
-# 3. ✅ 完全对齐 TV 的 AHR999 计算
-# ═════════════════════════════════════════════════════════
-
-def calculate_ahr999(df):
-    df = df.copy().sort_values("日期").reset_index(drop=True)
-
-    # ---------- 1. SMA200 ----------
-    df["sma200"] = df["close"].rolling(200).mean()
-
-    # ---------- 2. 币龄（天） ----------
+    # ---------- 币龄 ----------
     genesis = pd.Timestamp("2009-01-03")
-    df["days_since_birth"] = np.maximum(
-        (df["日期"] - genesis).dt.days, 1
-    )
+    days = (df["date"] - genesis).dt.total_seconds() / 86400.0
+    days = np.maximum(days, 1.0)
 
-    # ---------- 3. 指数增长估值（幂律） ----------
-    df["log_coin_age"] = np.log10(df["days_since_birth"])
-    df["index_growth_val"] = 10 ** (
-        5.84 * df["log_coin_age"] - 17.01
-    )
+    # ---------- 指数增长估值（幂律）----------
+    log_age = np.log10(days)
+    df["index_growth_val"] = 10 ** (5.84 * log_age - 17.01)
 
-    # ---------- 4. ✅ 流通供应量（BTC_SUPPLY） ----------
-    days = df["days_since_birth"].values
-    halvings = days // 210000
-    reward = 50 * (0.5 ** halvings)
-    supply = days * 144 * reward
-    df["supply"] = supply / 1e8  # 转为 BTC 单位
+    # ---------- ✅ AHR999 ----------
+    df["ahr999"] = (df["close"] / df["sma200"]) * (df["close"] / df["index_growth_val"])
 
-    # ---------- 5. ✅ 已实现市值（Realized Cap） ----------
-    # TV: realized_cap = request.security("BTC_MARKETCAPREAL")
-    # 用 SMA200 × 流通量作为高保真近似
-    df["realized_cap"] = df["sma200"] * df["supply"]
+    # ---------- 偏离幅度（现价 vs SMA200）----------
+    df["deviation_pct"] = (df["close"] - df["sma200"]) / df["sma200"] * 100
 
-    # ---------- 6. ✅ 实现价值（Realized Price） ----------
-    df["realized_price"] = df["realized_cap"] / df["supply"]
-
-    # ---------- 7. ✅ AHR999 ----------
-    # TV: ahr999 = close / sma200 * (close / indexGrowthVal)
-    df["ahr999"] = (
-        df["close"] / df["sma200"] *
-        df["close"] / df["index_growth_val"]
-    )
-
-    # ---------- 8. 偏离幅度 ----------
-    df["deviation_pct"] = (
-        (df["close"] - df["realized_price"]) / df["realized_price"] * 100
-    )
+    # ---------- 涨跌幅 ----------
+    if "change_pct" not in df.columns:
+        df["change_pct"] = df["close"].pct_change() * 100
 
     return df
 
-# ═════════════════════════════════════════════════════════
-# 4. 区间判断（九神标准）
-# ═════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+# 2. 区间判定（九神标准）
+# ════════════════════════════════════════════════════════
 
-def assign_zone(df):
-    def zone(x):
+ZONE_RULES = [
+    (0.45, "极度低估", "#00e676"),
+    (0.80, "定投区",   "#76ff03"),
+    (1.20, "合理区",   "#ffd600"),
+    (2.00, "偏高",     "#ff9100"),
+    (np.inf, "高估",    "#ff1744"),
+]
+
+def assign_zone(df: pd.DataFrame) -> pd.DataFrame:
+    def _zone(x):
         if pd.isna(x):
             return "数据不足"
-        if x < 0.45:
-            return "极度低估"
-        if x < 0.8:
-            return "定投区"
-        if x < 1.2:
-            return "合理区"
-        if x < 2.0:
-            return "偏高"
+        for cap, label, _ in ZONE_RULES:
+            if x < cap:
+                return label
         return "高估"
-    df["zone"] = df["ahr999"].apply(zone)
+    df["zone"] = df["ahr999"].apply(_zone)
     return df
 
-# ═════════════════════════════════════════════════════════
-# 5. 流水线
-# ═════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════
+# 3. 异常 K 线检测
+# ════════════════════════════════════════════════════════
 
-def run_pipeline(force_refresh=False):
+def detect_anomalies(df: pd.DataFrame, z_thresh: float = 4.0) -> pd.DataFrame:
+    df = df.copy()
+    if "change_pct" not in df.columns:
+        df["change_pct"] = df["close"].pct_change() * 100
+
+    mean = df["change_pct"].rolling(200, min_periods=30).mean()
+    std = df["change_pct"].rolling(200, min_periods=30).std()
+    df["anomaly"] = (df["change_pct"].abs() > z_thresh * std) & df["change_pct"].notna()
+    return df
+
+# ════════════════════════════════════════════════════════
+# 4. 流水线
+# ════════════════════════════════════════════════════════
+
+def run_pipeline(src: str = "btc_cache.csv"):
     print(f"\n{'='*60}")
-    print(f"  ₿ BTC AHR999 Pipeline（TV 对齐最终版）")
+    print(f"  ₿ BTC AHR999 Pipeline（用户数据版）")
     print(f"{'='*60}\n")
 
-    df = fetch_btc_data(force_refresh)
+    df = load_btc_data(src)
+    print(f"📊 原始数据: {len(df)} 行 | {df['date'].min().date()} → {df['date'].max().date()}")
+
     df = calculate_ahr999(df)
     df = assign_zone(df)
+    df = detect_anomalies(df)
 
-    latest = df.dropna(subset=["ahr999"]).iloc[-1]
+    valid = df.dropna(subset=["ahr999"])
+    n_valid = len(valid)
+    n_total = len(df)
+    print(f"✅ AHR999 有效: {n_valid}/{n_total} 行")
+    print(f"⚠️ 异常 K 线: {int(df['anomaly'].sum())} 根")
 
-    print(f"\n📅 最新日期: {latest['日期'].strftime('%Y-%m-%d')}")
-    print(f"📈 现价: ${latest['close']:,.2f}")
-    print(f"💰 实现价值 (Realized Price): ${latest['realized_price']:,.2f}")
-    print(f"📊 偏离幅度: {latest['deviation_pct']:.2f}%")
-    print(f"📐 SMA200: ${latest['sma200']:,.2f}")
-    print(f"🌐 幂律估值: ${latest['index_growth_val']:,.2f}")
-    print(f"📐 AHR999: {latest['ahr999']:.4f}")
-    print(f"🏷️ 区间: {latest['zone']}")
+    if n_valid > 0:
+        latest = valid.iloc[-1]
+        print(f"\n📅 最新日期:  {latest['date'].strftime('%Y-%m-%d')}")
+        print(f"📈 现价:       ${latest['close']:>12,.2f}")
+        print(f"📊 偏离幅度:    {latest['deviation_pct']:>11.2f}%")
+        print(f"📐 SMA200:      ${latest['sma200']:>12,.2f}")
+        print(f"🌐 幂律估值:    ${latest['index_growth_val']:>12,.2f}")
+        print(f"📐 AHR999:     {latest['ahr999']:>12.4f}")
+        print(f"🏷️  区间:        {latest['zone']}")
+    else:
+        print("⚠️ 无有效 AHR999 数据（数据量不足 200 行）")
 
     return df
 
 if __name__ == "__main__":
-    run_pipeline(force_refresh=True)
+    run_pipeline()

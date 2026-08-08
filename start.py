@@ -1,219 +1,207 @@
 """
-start.py
-BTC AHR999 定投指标工具 · 入口
-
-用法：
-  python start.py            # 完整管线（默认）
-  python start.py --pages    # 生成 _site/ 静态站
-  python start.py --web      # 启动本地 Web 预览
-  python start.py --cli      # 仅控制台输出
-  python start.py --once     # 单次运行（同默认）
-  python start.py --pages --force-refresh   # 强制刷新数据
+入口：python start.py [--pages] [--src btc_cache.csv]
 """
-
 import argparse
-import logging
-import datetime
+import sys
+import os
+import json
+import pandas as pd
+import numpy as np
 
-from ahr999 import run_pipeline
+import ahr999 as ahr
 
-log = logging.getLogger(__name__)
+# ═══════════════════════════════════════════════════════
+# 工具
+# ═══════════════════════════════════════════════════════
 
-# ═════════════════════════════════════════════════════════
-#  Pages 模式：生成静态站
-# ═════════════════════════════════════════════════════════
+def _clean_for_json(df: pd.DataFrame) -> pd.DataFrame:
+    """把 NaN/Inf 替换成 None，避免 JSON 报错"""
+    df = df.replace([np.inf, -np.inf], np.nan)
+    return df.where(pd.notna(df), None)
 
-def run_pages(force_refresh=False):
-    """跑管线 + 生成 _site/index.html"""
-    df = run_pipeline(force_refresh=force_refresh)
+def _build_cards(df: pd.DataFrame) -> dict:
+    """构造网页顶部 4 张卡片数据（无"实现价值"）"""
+    valid = df.dropna(subset=["ahr999"])
+    if valid.empty:
+        return {}
+    latest = valid.iloc[-1]
+    return {
+        "date": latest["date"].strftime("%Y-%m-%d"),
+        "close": float(latest["close"]),
+        "ahr999": float(latest["ahr999"]),
+        "deviation_pct": float(latest["deviation_pct"]),
+        "sma200": float(latest["sma200"]),
+        "index_growth_val": float(latest["index_growth_val"]),
+        "zone": latest["zone"],
+        "rows": int(len(df)),
+    }
 
-    # 生成 index.html（引用 data.js，离线可用）
-    try:
-        from pathlib import Path
-        import json
+# ═══════════════════════════════════════════════════════
+# Pages 模式：生成 _site/
+# ═══════════════════════════════════════════════════════
 
-        pages_dir = "_site"
-        Path(pages_dir).mkdir(exist_ok=True)
+def run_pages(src: str = "btc_cache.csv"):
+    df = ahr.run_pipeline(src)
 
-        # 复制模板
-        template_path = "templates/index.html"
-        out_path = f"{pages_dir}/index.html"
+    os.makedirs("_site", exist_ok=True)
 
-        if Path(template_path).exists():
-            html = Path(template_path).read_text(encoding="utf-8")
-        else:
-            # 极简内嵌模板（无 templates/ 时也能跑）
-            html = """<!DOCTYPE html>
-<html lang="zh-CN">
+    # 1) data.js（前端渲染用）
+    out = df.copy()
+    out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+    out = _clean_for_json(out)
+    records = out.to_dict(orient="records")
+    cards = _build_cards(df)
+
+    with open("_site/data.js", "w", encoding="utf-8") as f:
+        f.write("window.BTC_DATA = ")
+        json.dump(records, f, ensure_ascii=False)
+        f.write(";\nwindow.BTC_CARDS = ")
+        json.dump(cards, f, ensure_ascii=False)
+        f.write(";")
+
+    # 2) index.html（极简展示页）
+    html = _render_html(cards, len(records))
+    with open("_site/index.html", "w", encoding="utf-8") as f:
+        f.write(html)
+
+    print(f"\n✅ _site/ 生成完成")
+    print(f"  📄 data.js  ({os.path.getsize('_site/data.js')/1024:.0f} KB)")
+    print(f"  📄 index.html ({os.path.getsize('_site/index.html')/1024:.0f} KB)")
+
+# ═══════════════════════════════════════════════════════
+# 简易 HTML 模板（4 张卡片：现价 / AHR999 / 偏离幅度 / 区间）
+# ═══════════════════════════════════════════════════════
+
+ZONE_COLORS = {
+    "极度低估": "#00e676",
+    "定投区":   "#76ff03",
+    "合理区":   "#ffd600",
+    "偏高":     "#ff9100",
+    "高估":     "#ff1744",
+    "数据不足": "#9e9e9e",
+}
+
+def _render_html(cards: dict, rows: int) -> str:
+    if not cards:
+        return "<h1>BTC AHR999</h1><p>暂无有效数据</p>"
+
+    zone = cards["zone"]
+    color = ZONE_COLORS.get(zone, "#9e9e9e")
+    dev = cards["deviation_pct"]
+    dev_sign = "+" if dev >= 0 else ""
+    dev_class = "up" if dev >= 0 else "down"
+
+    return f"""<!doctype html>
+<html lang="zh">
 <head>
-<meta charset="UTF-8">
-<title>BTC AHR999 指标表</title>
+<meta charset="utf-8">
+<title>BTC AHR999 指标</title>
 <style>
-  body { background:#0d1117; color:#c9d1d9; font-family:-apple-system,sans-serif; margin:0; padding:16px; }
-  h1 { color:#58a6ff; font-size:1.2rem; }
-  table { border-collapse:collapse; width:100%; font-size:13px; }
-  th { background:#161b22; color:#8b949e; padding:6px 8px; text-align:left; border-bottom:1px solid #30363d; }
-  td { padding:5px 8px; border-bottom:1px solid #21262d; }
-  tr:hover td { background:#161b22; }
-  .extreme { background:rgba(46,160,67,.15); }
-  .dca { background:rgba(110,118,129,.12); }
-  .high { background:rgba(248,81,73,.12); }
-  .over { background:rgba(248,81,73,.25); }
-  .up { color:#3fb950; }
-  .down { color:#f85149; }
-  .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; }
-  .b-buy { background:#1f6f3a; color:#c9f7d0; }
-  .b-sell { background:#6b1a1a; color:#f7c9c9; }
-  .cards { display:flex; flex-wrap:wrap; gap:10px; margin:12px 0; }
-  .card { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:10px 14px; min-width:180px; }
-  .card .label { font-size:11px; color:#8b949e; }
-  .card .val { font-size:1.3rem; font-weight:700; }
-  .legend span { display:inline-block; width:14px; height:14px; vertical-align:middle; margin:0 4px 0 10px; border-radius:3px; }
+  body {{ font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+         background:#0e1117;color:#e6e6e6;margin:0;padding:24px; }}
+  h1 {{ margin:0 0 4px;font-size:20px; }}
+  .meta {{ color:#888;font-size:13px;margin-bottom:20px; }}
+  .cards {{ display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px; }}
+  .card {{ background:#161b22;border:1px solid #30363d;border-radius:10px;padding:16px; }}
+  .card .label {{ font-size:12px;color:#8b949e;margin-bottom:6px; }}
+  .card .value {{ font-size:22px;font-weight:700; }}
+  .card .sub {{ font-size:12px;color:#8b949e;margin-top:4px; }}
+  .up {{ color:#00e676; }} .down {{ color:#ff1744; }}
+  .zone-badge {{ display:inline-block;padding:4px 10px;border-radius:20px;
+                background:{color}22;color:{color};font-weight:600;font-size:13px; }}
+  table {{ width:100%;border-collapse:collapse;margin-top:24px;font-size:13px; }}
+  th,td {{ padding:6px 10px;text-align:right;border-bottom:1px solid #21262d; }}
+  th {{ background:#161b22;color:#8b949e;position:sticky;top:0; }}
+  tr:hover td {{ background:#161b22; }}
+  .dot {{ display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;vertical-align:middle; }}
 </style>
 </head>
 <body>
-<h1>₿ BTC AHR999 指标表</h1>
-<div id="meta"></div>
-<div class="cards" id="cards"></div>
-<div class="legend">
-  <span style="background:rgba(46,160,67,.5)"></span>极度低估
-  <span style="background:rgba(110,118,129,.5)"></span>定投区
-  <span style="background:rgba(187,128,9,.4)"></span>合理偏高
-  <span style="background:rgba(248,81,73,.5)"></span>高估
-  <span style="background:rgba(248,81,73,.8)"></span>高估+异常
+<h1>₿ BTC AHR999 定投指标</h1>
+<div class="meta">更新时间: {cards['date']} · 数据: {rows} 行 · 数据源: 用户上传</div>
+
+<div class="cards">
+  <div class="card">
+    <div class="label">最新价</div>
+    <div class="value">${cards['close']:,.2f}</div>
+    <div class="sub">AHR999: <b>{cards['ahr999']:.4f}</b></div>
+  </div>
+  <div class="card">
+    <div class="label">区间</div>
+    <div class="value"><span class="zone-badge">{zone}</span></div>
+    <div class="sub">SMA200: ${cards['sma200']:,.2f}</div>
+  </div>
+  <div class="card">
+    <div class="label">较 SMA200 幅度</div>
+    <div class="value {dev_class}">{dev_sign}{dev:.2f}%</div>
+    <div class="sub">幂律估值: ${cards['index_growth_val']:,.0f}</div>
+  </div>
+  <div class="card">
+    <div class="label">操作提示</div>
+    <div class="value" style="font-size:15px;line-height:1.5;">
+      {"⚠️ 极度低估，分批抄底" if zone=="极度低估" else
+       "🟢 定投区，逢低买入" if zone=="定投区" else
+       "🟡 合理区，持有观望" if zone=="合理区" else
+       "🟠 偏高，减少买入" if zone=="偏高" else
+       "🔴 高估，考虑减仓"}
+    </div>
+  </div>
 </div>
-<div id="tablewrap" style="overflow:auto; max-height:70vh; margin-top:8px;"></div>
+
+<div id="table-root"></div>
+
 <script src="data.js"></script>
 <script>
-const fmt = (v,d=2) => v==null||isNaN(v) ? '-' : Number(v).toLocaleString('en-US',{maximumFractionDigits:d});
-const pct = v => v==null ? '-' : (v>=0?'+':'') + Number(v).toFixed(2)+'%';
-const $ = s => document.querySelector(s);
+const ZONE_COLORS = {json.dumps(ZONE_COLORS)};
+const data = window.BTC_DATA || [];
+const root = document.getElementById('table-root');
 
-function render() {
-  if (!AHR999_DATA || !AHR999_DATA.length) return;
-  const last = AHR999_DATA[AHR999_DATA.length-1];
-  const meta = $('#meta');
-  meta.innerHTML = `<div style="color:#8b949e;font-size:12px;margin:6px 0">
-    更新: ${last.日期||''} | 数据: ${AHR999_DATA.length} 行
-    | 最新AHR999: <b style="color:#58a6ff">${fmt(last.ahr999,4)}</b>
-    | 区间: <b>${last.zone||''}</b>
-    | 现价: $${fmt(last.close)}
-  </div>`;
+function fmt(n, d=2) {{
+  if (n==null) return '-';
+  return Number(n).toLocaleString('en-US', {{minimumFractionDigits:d, maximumFractionDigits:d}});
+}}
 
-  // 卡片
-  const cards = $('#cards');
-  const cardsHTML = [
-    {label:'持仓', val:fmt(last.hold_qty,8)+' BTC', sub:`均价 $${fmt(last.hold_avg)}`},
-    {label:'最新价', val:'$'+fmt(last.close), sub:`AHR999 ${fmt(last.ahr999,4)}`},
-    {label:'MA200', val:'$'+fmt(last.ma200), sub:`偏离 ${pct(last.deviation_pct)}`},
-    {label:'区间', val:last.zone||'-', sub:last.zone_combo||''},
-  ].map(c=>`<div class="card"><div class="label">${c.label}</div><div class="val">${c.val}</div><div class="label">${c.sub||''}</div></div>`).join('');
-  cards.innerHTML = cardsHTML;
+let html = '<table><thead><tr>' +
+  '<th>日期</th><th>AHR999</th><th>收盘</th><th>高</th><th>低</th>' +
+  '<th>涨跌幅%</th><th>区间</th><th>SMA200</th></tr></thead><tbody>';
 
-  // 表格
-  const cols = ['日期','ahr999','open','close','high','low','成交量','daily_change_pct','zone','trade_action','trade_price','trade_qty','fee_paid','realized_pnl','hold_qty','hold_avg'];
-  const colName = {ahr999:'AHR999',daily_change_pct:'涨跌幅%',trade_action:'操作',trade_price:'价格',trade_qty:'数量',fee_paid:'手续费',realized_pnl:'已实现盈亏',hold_qty:'持仓',hold_avg:'均价'};
-  let html = '<table><thead><tr>'+cols.map(c=>`<th>${colName[c]||c}</th>`).join('')+'</tr></thead><tbody>';
-  const rows = AHR999_DATA.slice(-500).reverse();
-  for (const r of rows) {
-    const z = r.zone||'';
-    let cls = '';
-    if (z.includes('极度低估')) cls='extreme';
-    else if (z.includes('定投')) cls='dca';
-    else if (z.includes('高估')) cls='over';
-    else if (z.includes('偏高')||z.includes('合理')) cls='high';
-    html += '<tr class="'+cls+'">';
-    for (const c of cols) {
-      let v = r[c];
-      if (c==='ahr999') v = fmt(v,4);
-      else if (c==='close'||c==='open'||c==='high'||c==='low') v = '$'+fmt(v);
-      else if (c==='daily_change_pct') { v = pct(v); if(v!='-' && v.startsWith('+')) v='<span class="up">'+v+'</span>'; else if(v!='-') v='<span class="down">'+v+'</span>'; }
-      else if (c==='trade_action') { v = v ? `<span class="badge b-${v==='买入'?'buy':'sell'}">${v}</span>` : ''; }
-      else if (['trade_price','hold_avg'].includes(c)) v = v?'$'+fmt(v):'-';
-      else if (['trade_qty','hold_qty'].includes(c)) v = fmt(v,6);
-      else if (c==='成交量') v = fmt(v,0);
-      else v = (v==null||v==='')?'-':v;
-      html += `<td>${v}</td>`;
-    }
-    html += '</tr>';
-  }
-  html += '</tbody></table>';
-  $('#tablewrap').innerHTML = html;
-}
-render();
+// 只渲染最近 500 行，避免 DOM 过大
+const slice = data.slice(-500).reverse();
+for (const r of slice) {{
+  const c = ZONE_COLORS[r.zone] || '#9e9e9e';
+  const chg = r.change_pct == null ? '-' : (r.change_pct>=0?'+':'') + Number(r.change_pct).toFixed(2) + '%';
+  const chgCls = r.change_pct == null ? '' : (r.change_pct>=0 ? 'up' : 'down');
+  html += '<tr>' +
+    '<td>' + r.date + '</td>' +
+    '<td><b>' + fmt(r.ahr999,4) + '</b></td>' +
+    '<td>$' + fmt(r.close) + '</td>' +
+    '<td>$' + fmt(r.high) + '</td>' +
+    '<td>$' + fmt(r.low) + '</td>' +
+    '<td class="' + chgCls + '">' + chg + '</td>' +
+    '<td><span class="dot" style="background:' + c + '"></span>' + (r.zone||'') + '</td>' +
+    '<td>$' + fmt(r.sma200) + '</td>' +
+  '</tr>';
+}}
+html += '</tbody></table>';
+root.innerHTML = html;
 </script>
 </body>
 </html>"""
 
-        Path(out_path).write_text(html, encoding="utf-8")
-        log.info(f"  ✅ 生成 {out_path}")
+# ═══════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════
 
-    except Exception as e:
-        log.warning(f"  ⚠️ 生成 index.html 失败: {e}")
-
-    # 复制产物到 _site
-    import shutil
-    for f in ["BTC_AHR999.xlsx", "ahr999_data.json"]:
-        if Path(f).exists():
-            shutil.copy2(f, f"{pages_dir}/{f}")
-            log.info(f"  📋 复制 {f} → {pages_dir}/")
-
-    print(f"\n  📂 _site/ 目录就绪, 可发布到 GitHub Pages")
-    return df
-
-
-# ═════════════════════════════════════════════════════════
-#  Web 模式：本地 Flask 预览
-# ═════════════════════════════════════════════════════════
-
-def run_web():
-    try:
-        from flask import Flask, jsonify, send_file
-    except ImportError:
-        print("❌ 需要安装 flask: pip install flask")
-        return
-
-    app = Flask(__name__, static_folder="_site", static_url_path="")
-
-    @app.route("/")
-    def index():
-        return send_file("_site/index.html")
-
-    @app.route("/api/data")
-    def api_data():
-        try:
-            import json as _json
-            with open("ahr999_data.json", encoding="utf-8") as f:
-                return jsonify(_json.load(f))
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-
-    print("\n  🌐 本地预览: http://127.0.0.1:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False)
-
-
-# ═════════════════════════════════════════════════════════
-#  主入口
-# ═════════════════════════════════════════════════════════
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BTC AHR999 定投指标工具")
-    parser.add_argument("--web",   action="store_true", help="启动本地 Web 预览")
-    parser.add_argument("--cli",   action="store_true", help="仅控制台输出")
-    parser.add_argument("--once",  action="store_true", help="单次运行（默认）")
-    parser.add_argument("--pages", action="store_true", help="生成 _site/ 静态站")
-    parser.add_argument("--force-refresh", action="store_true", help="强制刷新数据")
+def main():
+    parser = argparse.ArgumentParser(description="BTC AHR999 工具")
+    parser.add_argument("--pages", action="store_true", help="生成 _site/ 静态站点")
+    parser.add_argument("--src", default="btc_cache.csv", help="BTC 数据 CSV 路径")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="  %(asctime)s │ %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
     if args.pages:
-        run_pages(force_refresh=args.force_refresh)
-    elif args.web:
-        run_web()
+        run_pages(args.src)
     else:
-        run_pipeline(force_refresh=args.force_refresh)
+        ahr.run_pipeline(args.src)
+
+if __name__ == "__main__":
+    main()
