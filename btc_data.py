@@ -1,92 +1,83 @@
-"""
-BTC 数据加载模块
-读取用户提供的 btc_cache.csv（中文表头、千分位逗号、K 单位、百分号）
-清洗为标准化 DataFrame
-"""
-import re
 import pandas as pd
-import numpy as np
+import os
 
-COLUMN_MAP = {
-    "日期": "date",
-    "收盘": "close",
-    "开盘": "open",
-    "高": "high",
-    "低": "low",
-    "交易量": "volume",
-    "涨跌幅": "change_pct",
-}
+def load_and_clean_btc_data(src_path="btc_cache.csv") -> pd.DataFrame:
+    """
+    读取并清洗 BTC 日线 CSV。
+    支持：中文表头、千分位逗号、GBK/UTF-8、百分号、K/M 单位等。
+    返回列：open / high / low / close / volume，index=日期。
+    """
+    if not os.path.exists(src_path):
+        raise FileNotFoundError(f"❌ 找不到数据文件: {src_path}")
 
-def _strip_quote(s: str) -> str:
-    s = s.strip()
-    if s.startswith('"') and s.endswith('"'):
-        s = s[1:-1]
-    return s
-
-def _coerce_numeric(raw) -> pd.Series:
-    """去掉千分位逗号、百分号、K/M/B 单位后转 float"""
-    s = raw.astype(str).map(_strip_quote).str.strip()
-    s = s.str.replace(",", "", regex=False)
-    s = s.str.replace("%", "", regex=False)
-
-    # 处理 K / M / B 单位
-    mult = pd.Series(1.0, index=s.index)
-    last_char = s.str[-1].str.upper()
-    mult[last_char == "K"] = 1e3
-    mult[last_char == "M"] = 1e6
-    mult[last_char == "B"] = 1e9
-
-    has_unit = last_char.isin(["K", "M", "B"])
-    if has_unit.any():
-        s_clean = s[has_unit].str[:-1].astype(float) * mult[has_unit]
-        s_out = s_clean.reindex(index=s.index)
-        s_out[~has_unit] = pd.to_numeric(s[~has_unit], errors="coerce")
-        return s_out.astype(float)
-
-    return pd.to_numeric(s, errors="coerce")
-
-def _parse_date(s: str) -> pd.Timestamp | None:
-    """解析 '2026年8月7日' 格式"""
-    m = re.match(r"(\d{4})年(\d{1,2})月(\d{1,2})日", s)
-    if m:
-        return pd.Timestamp(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    # 兜底：交给 pandas
-    try:
-        return pd.to_datetime(s, format="mixed", errors="raise")
-    except Exception:
-        return None
-
-def load_btc_data(path: str = "btc_cache.csv") -> pd.DataFrame:
-    """加载并清洗 BTC 日线数据"""
-    # 先按原始读取，避免引号/逗号干扰
-    raw = pd.read_csv(path, header=0, dtype=str, encoding="utf-8-sig")
-    raw.columns = raw.columns.str.strip()
-
-    # 重命名
-    raw = raw.rename(columns=COLUMN_MAP)
-
-    # 逐列清洗
-    df = pd.DataFrame()
-    df["date"] = raw["date"].map(_parse_date)
-    for c in ["open", "high", "low", "close"]:
-        if c in raw.columns:
-            df[c] = _coerce_numeric(raw[c])
-    if "volume" in raw.columns:
-        df["volume"] = _coerce_numeric(raw["volume"])
+    # 尝试多种编码
+    for enc in ("utf-8-sig", "utf-8", "gbk", "gb2312", "cp936"):
+        try:
+            df = pd.read_csv(src_path, encoding=enc)
+            break
+        except (UnicodeDecodeError, pd.errors.ParserError):
+            continue
     else:
-        df["volume"] = 0.0
-    if "change_pct" in raw.columns:
-        df["change_pct"] = _coerce_numeric(raw["change_pct"])
+        raise RuntimeError(f"❌ 无法读取 {src_path}，请检查编码和格式")
 
-    # 去空、去重、排序
-    df = df.dropna(subset=["date", "close"]).drop_duplicates("date").sort_values("date").reset_index(drop=True)
-    df["volume"] = df["volume"].fillna(0.0)
+    # 统一列名（兼容中英文）
+    rename_map = {}
+    for c in df.columns:
+        s = str(c).strip().lower()
+        if s in ("date", "日期", "时间", "datetime"):
+            rename_map[c] = "日期"
+        elif s in ("open", "开盘", "开盘价"):
+            rename_map[c] = "open"
+        elif s in ("high", "最高", "最高价"):
+            rename_map[c] = "high"
+        elif s in ("low", "最低", "最低价"):
+            rename_map[c] = "low"
+        elif s in ("close", "收盘", "收盘价", "price"):
+            rename_map[c] = "close"
+        elif s in ("volume", "成交量", "vol"):
+            rename_map[c] = "volume"
+    df = df.rename(columns=rename_map)
 
+    # 必须有日期和收盘价
+    if "日期" not in df.columns or "close" not in df.columns:
+        raise ValueError(
+            f"❌ CSV 缺少必要列。现有列: {list(df.columns)}，"
+            "需要包含：日期、开盘、最高、最低、收盘（或英文 OHLC）"
+        )
+
+    # 解析日期
+    df["日期"] = pd.to_datetime(df["日期"], infer_datetime_format=True, errors="coerce")
+    df = df.dropna(subset=["日期", "close"]).set_index("日期").sort_index()
+
+    # 数值清洗：去千分位逗号、去百分号、去 K/M 单位
+    def to_num(s):
+        if s is None:
+            return pd.NA
+        s = str(s).strip().replace(",", "").replace("，", "")
+        mult = 1
+        if s.endswith("%"):
+            s = s[:-1]
+            mult = 0.01
+        if s.endswith("K"):
+            s = s[:-1]
+            mult *= 1000
+        elif s.endswith("M"):
+            s = s[:-1]
+            mult *= 1_000_000
+        try:
+            return float(s) * mult
+        except ValueError:
+            return pd.NA
+
+    for col in ("open", "high", "low", "close", "volume"):
+        if col in df.columns:
+            df[col] = df[col].apply(to_num)
+        else:
+            # 缺失的 OHLC 用 close 补齐
+            df[col] = df["close"]
+
+    df = df[["open", "high", "low", "close", "volume"]].dropna(subset=["close"])
+    df.index.name = "日期"
+
+    print(f"✅ 数据加载完成: {len(df)} 行  ({df.index.min()} → {df.index.max()})")
     return df
-
-if __name__ == "__main__":
-    df = load_btc_data()
-    print(f"✅ 加载完成: {len(df)} 行 | {df['date'].min().date()} → {df['date'].max().date()}")
-    print(df.head(3).to_string())
-    print("...")
-    print(df.tail(3).to_string())
