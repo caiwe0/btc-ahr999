@@ -4,32 +4,51 @@ import numpy as np
 from btc_data import load_and_clean_btc_data
 
 # ═════════════════════════════════════════════════════════
-# AHR999 计算（100% 对齐 TradingView 公式）
+# AHR999 计算（✅ 修复 Power Law + 数值稳定性）
 # ═════════════════════════════════════════════════════════
 
 def calculate_sma200(df: pd.DataFrame) -> pd.DataFrame:
-    df["sma200"] = df["close"].rolling(window=200, min_periods=1).mean()
+    """
+    SMA200：至少 200 个交易日才有效
+    """
+    df["sma200"] = df["close"].rolling(window=200, min_periods=200).mean()
     return df
+
 
 def calculate_power_law(df: pd.DataFrame) -> pd.DataFrame:
     """
-    幂律估值: y = 10^(a * log10(x) + b)
+    幂律估值（TV 对齐）
+    y = 10^(a * log10(x) + b)
     x = 天数（从 2009-01-03 起算）
     """
     genesis = pd.Timestamp("2009-01-03")
+
+    # ✅ 正确方式：逐行计算天数
     days = (df.index - genesis).days + 1
-    a, b = 2.48, -17.02
+    days = days.clip(lower=1)
+
+    a, b = 5.84, -17.01  # ✅ 九神官方系数
+
     df["index_growth_val"] = 10 ** (a * np.log10(days) + b)
     return df
+
 
 def calculate_ahr999(df: pd.DataFrame) -> pd.DataFrame:
     df = calculate_sma200(df)
     df = calculate_power_law(df)
 
-    # TV: ahr999 = close / sma200 * (close / indexGrowthVal)
-    df["ahr999"] = (
-        df["close"] / df["sma200"] *
-        df["close"] / df["index_growth_val"]
+    # ✅ 只在有效数据上计算 AHR999
+    mask = (
+        df["sma200"].notna() &
+        df["index_growth_val"].notna() &
+        (df["index_growth_val"] > 0)
+    )
+
+    df["ahr999"] = np.where(
+        mask,
+        (df["close"] / df["sma200"]) *
+        (df["close"] / df["index_growth_val"]),
+        np.nan
     )
 
     # 偏离幅度（相对 SMA200）
@@ -42,6 +61,7 @@ def calculate_ahr999(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def assign_zone(df: pd.DataFrame) -> pd.DataFrame:
     conditions = [
         df["ahr999"] < 0.45,
@@ -53,13 +73,14 @@ def assign_zone(df: pd.DataFrame) -> pd.DataFrame:
     df["zone"] = np.select(conditions, choices, default="未知")
     return df
 
+
 # ═════════════════════════════════════════════════════════
 # 流水线入口
 # ═════════════════════════════════════════════════════════
 
 def run_pipeline(src_path: str = "btc_cache.csv") -> pd.DataFrame:
     print("\n" + "=" * 60)
-    print("  ₿ BTC AHR999 Pipeline（本地数据版）")
+    print("  ₿ BTC AHR999 Pipeline（✅ 修复版）")
     print("=" * 60 + "\n")
 
     df = load_and_clean_btc_data(src_path)
@@ -77,6 +98,7 @@ def run_pipeline(src_path: str = "btc_cache.csv") -> pd.DataFrame:
     print(f"📊 偏离幅度: {latest['deviation_pct']:.2f}%")
 
     return df
+
 
 if __name__ == "__main__":
     run_pipeline()
